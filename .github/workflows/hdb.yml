@@ -1,0 +1,59 @@
+name: HDB CI-CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 5,11,17,23 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m unittest -v
+
+  ingest:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency: hdb-bronze
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Fetch HDB snapshot and upload to Bronze
+        shell: bash
+        run: |
+          file="$(python ingest.py)"
+          blob="${file#data/}"
+          echo "Snapshot: $blob"
+          target=(--account-name "$AZURE_STORAGE_ACCOUNT" --container-name bronze
+                  --name "$blob" --auth-mode login)
+          exists="$(az storage blob exists "${target[@]}" --query exists -o tsv)"
+          if [[ "${exists,,}" == "false" ]]; then
+            az storage blob upload "${target[@]}" --file "$file" \
+              --content-type application/json --overwrite false -o none
+          fi
+          az storage blob show "${target[@]}" --query name -o tsv
